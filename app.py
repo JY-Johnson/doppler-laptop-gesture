@@ -395,6 +395,8 @@ class App:
         self.page_control = tk.BooleanVar(value=False)
         self.status = tk.StringVar(value="未启动")
         self.detail = tk.StringVar(value="桌面翻页默认关闭；启动后请先完成校准。")
+        self.gesture_info = tk.StringVar(value="最近手势：无")
+        self.signal_info = tk.StringVar(value="当前频谱：等待音频输入")
         self.last_draw_at = 0.0
         self.build_ui()
         self.root.protocol("WM_DELETE_WINDOW", self.close)
@@ -423,6 +425,10 @@ class App:
         ttk.Label(outer, textvariable=self.status, font=("Segoe UI", 17, "bold")).pack(anchor="w", pady=(12, 2))
         self.meter = ttk.Progressbar(outer, maximum=100, mode="determinate")
         self.meter.pack(fill="x", pady=(0, 6))
+        gesture_box = ttk.LabelFrame(outer, text="手势检测信息", padding=8)
+        gesture_box.pack(fill="x", pady=(6, 0))
+        ttk.Label(gesture_box, textvariable=self.gesture_info, font=("Segoe UI", 13, "bold")).pack(anchor="w")
+        ttk.Label(gesture_box, textvariable=self.signal_info).pack(anchor="w", pady=(3, 0))
         ttk.Label(outer, textvariable=self.detail, wraplength=880).pack(anchor="w")
 
         spectrum_box = ttk.LabelFrame(outer, text="18 kHz 附近实时频谱", padding=8)
@@ -470,6 +476,8 @@ class App:
         self.start_button.configure(state="disabled")
         self.stop_button.configure(state="normal")
         self.status.set("正在启动音频…")
+        self.gesture_info.set("最近手势：等待校准")
+        self.signal_info.set("当前频谱：等待校准完成")
 
     def stop(self) -> None:
         if self.engine is not None:
@@ -481,27 +489,38 @@ class App:
         self.stop_button.configure(state="disabled")
         self.status.set("已停止")
         self.meter.configure(value=0)
+        self.gesture_info.set("最近手势：无")
+        self.signal_info.set("当前频谱：等待音频输入")
 
     def add_event(self, text: str) -> None:
         self.events.insert(0, f"{time.strftime('%H:%M:%S')}  {text}")
         while self.events.size() > 8:
             self.events.delete(8)
 
-    def handle_event(self, event: GestureEvent) -> None:
+    def handle_event(self, event: GestureEvent, snapshot: Snapshot) -> None:
+        signal = f"频移峰值 {snapshot.peak_offset:+.0f} Hz · {snapshot.peak_db:.0f} dB · 强度 {snapshot.meter:.0f}%"
         if event.kind == "wave":
             self.add_event(event.label)
+            self.gesture_info.set(f"最近手势：{event.label}（不发送翻页）")
+            self.signal_info.set(signal)
             return
         if not self.page_control.get():
             self.add_event(f"{event.label}（翻页关闭）")
+            self.gesture_info.set(f"最近手势：{event.label} · 未发送（翻页开关关闭）")
+            self.signal_info.set(signal)
             return
         try:
             target = self.controller.foreground_title() or "未知窗口"
             self.controller.send("down" if event.kind == "approach" else "up")
             key = "PageDown" if event.kind == "approach" else "PageUp"
             self.add_event(f"{event.label}  →  {key}  [{target}]")
+            self.gesture_info.set(f"最近手势：{event.label} · 已发送 {key} → {target}")
+            self.signal_info.set(signal)
             self.detail.set(f"已向前台窗口发送 {key}：{target}")
         except Exception as exc:
             self.add_event(f"{event.label}  按键失败：{exc}")
+            self.gesture_info.set(f"最近手势：{event.label} · 按键发送失败")
+            self.signal_info.set(signal)
             self.detail.set(f"按键发送失败：{exc}")
 
     def draw_spectrum(self, snapshot: Snapshot) -> None:
@@ -548,6 +567,8 @@ class App:
             snapshot = self.engine.current_snapshot()
             self.status.set(snapshot.status)
             self.meter.configure(value=snapshot.meter)
+            if snapshot.spectrum_db:
+                self.signal_info.set(f"当前频谱：峰值 Δf {snapshot.peak_offset:+.0f} Hz · {snapshot.peak_db:.0f} dB")
             now = time.monotonic()
             if now - self.last_draw_at >= 0.12:
                 self.draw_spectrum(snapshot)
@@ -557,7 +578,7 @@ class App:
                     event = self.engine.events.get_nowait()
                 except queue.Empty:
                     break
-                self.handle_event(event)
+                self.handle_event(event, snapshot)
         else:
             if time.monotonic() - self.last_draw_at >= 0.12:
                 self.draw_spectrum(Snapshot())
