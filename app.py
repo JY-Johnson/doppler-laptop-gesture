@@ -383,7 +383,7 @@ class PageController:
 class App:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
-        self.root.title("Doppler 翻页控制")
+        self.root.title("Doppler 连续翻页控制")
         self.root.geometry("940x680")
         self.root.minsize(780, 580)
         self.detector: Optional[DopplerDetector] = None
@@ -393,6 +393,10 @@ class App:
         self.sensitivity = tk.IntVar(value=3)
         self.gain = tk.DoubleVar(value=0.02)
         self.page_control = tk.BooleanVar(value=False)
+        self.repeat_ms = tk.IntVar(value=900)
+        self.repeat_direction: Optional[str] = None
+        self.repeat_job: Optional[str] = None
+        self.repeat_count = 0
         self.status = tk.StringVar(value="未启动")
         self.detail = tk.StringVar(value="桌面翻页默认关闭；启动后请先完成校准。")
         self.gesture_info = tk.StringVar(value="最近手势：无")
@@ -406,7 +410,7 @@ class App:
         outer = ttk.Frame(self.root, padding=16)
         outer.pack(fill="both", expand=True)
         ttk.Label(outer, text="Doppler 翻页控制", font=("Segoe UI", 20, "bold")).pack(anchor="w")
-        ttk.Label(outer, text="靠近 → PageDown，远离 → PageUp；挥动只显示事件，不执行翻页。").pack(anchor="w", pady=(2, 12))
+        ttk.Label(outer, text="靠近/远离启动连续翻页，挥手停止连续翻页。").pack(anchor="w", pady=(2, 12))
 
         controls = ttk.LabelFrame(outer, text="控制", padding=10)
         controls.pack(fill="x")
@@ -420,7 +424,9 @@ class App:
         ttk.Label(controls, textvariable=self.sensitivity, width=3).grid(row=0, column=5)
         ttk.Label(controls, text="载波音量").grid(row=0, column=6, padx=(18, 0), sticky="e")
         ttk.Scale(controls, from_=0.005, to=0.06, variable=self.gain, orient="horizontal", length=150).grid(row=0, column=7, padx=8)
-        ttk.Checkbutton(controls, text="启用桌面翻页（当前前台窗口）", variable=self.page_control, command=self.control_changed).grid(row=1, column=0, columnspan=8, sticky="w", pady=(8, 0))
+        ttk.Label(controls, text="连续间隔(ms)").grid(row=1, column=0, sticky="w", pady=(8, 0))
+        ttk.Spinbox(controls, from_=300, to=3000, increment=100, textvariable=self.repeat_ms, width=8).grid(row=1, column=1, sticky="w", pady=(8, 0))
+        ttk.Checkbutton(controls, text="启用桌面翻页（当前前台窗口）", variable=self.page_control, command=self.control_changed).grid(row=1, column=2, columnspan=6, sticky="w", pady=(8, 0))
 
         ttk.Label(outer, textvariable=self.status, font=("Segoe UI", 17, "bold")).pack(anchor="w", pady=(12, 2))
         self.meter = ttk.Progressbar(outer, maximum=100, mode="determinate")
@@ -441,7 +447,55 @@ class App:
         self.events.pack(fill="x")
 
     def control_changed(self) -> None:
-        self.detail.set("桌面翻页已开启：靠近发送 PageDown，远离发送 PageUp。" if self.page_control.get() else "桌面翻页已关闭，只显示检测结果，不发送按键。")
+        if self.page_control.get():
+            self.detail.set("桌面翻页已开启：靠近/远离会持续翻页，挥手停止。")
+        else:
+            self.stop_continuous("翻页开关关闭")
+            self.detail.set("桌面翻页已关闭，只显示检测结果，不发送按键。")
+
+    def stop_continuous(self, reason: str = "", quiet: bool = False) -> None:
+        if self.repeat_job is not None:
+            try:
+                self.root.after_cancel(self.repeat_job)
+            except tk.TclError:
+                pass
+        was_running = self.repeat_direction is not None
+        self.repeat_job = None
+        self.repeat_direction = None
+        self.repeat_count = 0
+        if reason and was_running and not quiet:
+            self.add_event(reason)
+
+    def start_continuous(self, direction: str, event_label: str, snapshot: Snapshot) -> None:
+        if self.repeat_direction == direction and self.repeat_job is not None:
+            return
+        if self.repeat_direction != direction:
+            self.stop_continuous(quiet=True)
+            self.repeat_direction = direction
+            self.repeat_count = 0
+        self.repeat_page(event_label, snapshot)
+
+    def repeat_page(self, event_label: str = "", snapshot: Optional[Snapshot] = None) -> None:
+        if not self.running or not self.page_control.get() or self.repeat_direction is None:
+            self.stop_continuous(quiet=True)
+            return
+        try:
+            target = self.controller.foreground_title() or "未知窗口"
+            self.controller.send(self.repeat_direction)
+            self.repeat_count += 1
+            key = "PageDown" if self.repeat_direction == "down" else "PageUp"
+            if self.repeat_count == 1:
+                self.add_event(f"{event_label} → 连续{key}启动 [{target}]")
+            self.gesture_info.set(f"连续翻页中：{key} × {self.repeat_count} → {target}（挥手停止）")
+            if snapshot is not None:
+                signal = f"频移峰值 {snapshot.peak_offset:+.0f} Hz · {snapshot.peak_db:.0f} dB · 强度 {snapshot.meter:.0f}%"
+                self.signal_info.set(signal)
+            interval = max(300, min(3000, int(self.repeat_ms.get())))
+            self.repeat_job = self.root.after(interval, self.repeat_page)
+        except Exception as exc:
+            self.stop_continuous(quiet=True)
+            self.add_event(f"连续翻页失败：{exc}")
+            self.detail.set(f"连续翻页失败：{exc}")
 
     def schedule_test(self) -> None:
         self.detail.set("测试已排队：请在 3 秒内切换到要翻页的浏览器、PDF 或 PPT 窗口。")
@@ -473,6 +527,7 @@ class App:
             messagebox.showerror("音频启动失败", str(exc))
             return
         self.running = True
+        self.stop_continuous(quiet=True)
         self.start_button.configure(state="disabled")
         self.stop_button.configure(state="normal")
         self.status.set("正在启动音频…")
@@ -480,6 +535,7 @@ class App:
         self.signal_info.set("当前频谱：等待校准完成")
 
     def stop(self) -> None:
+        self.stop_continuous("软件已停止")
         if self.engine is not None:
             self.engine.stop()
         self.engine = None
@@ -500,8 +556,9 @@ class App:
     def handle_event(self, event: GestureEvent, snapshot: Snapshot) -> None:
         signal = f"频移峰值 {snapshot.peak_offset:+.0f} Hz · {snapshot.peak_db:.0f} dB · 强度 {snapshot.meter:.0f}%"
         if event.kind == "wave":
-            self.add_event(event.label)
-            self.gesture_info.set(f"最近手势：{event.label}（不发送翻页）")
+            self.stop_continuous(quiet=True)
+            self.add_event(f"{event.label} → 已停止连续翻页")
+            self.gesture_info.set(f"最近手势：{event.label} · 连续翻页已停止")
             self.signal_info.set(signal)
             return
         if not self.page_control.get():
@@ -510,16 +567,14 @@ class App:
             self.signal_info.set(signal)
             return
         try:
-            target = self.controller.foreground_title() or "未知窗口"
-            self.controller.send("down" if event.kind == "approach" else "up")
-            key = "PageDown" if event.kind == "approach" else "PageUp"
-            self.add_event(f"{event.label}  →  {key}  [{target}]")
-            self.gesture_info.set(f"最近手势：{event.label} · 已发送 {key} → {target}")
+            direction = "down" if event.kind == "approach" else "up"
+            self.start_continuous(direction, event.label, snapshot)
             self.signal_info.set(signal)
-            self.detail.set(f"已向前台窗口发送 {key}：{target}")
+            self.detail.set("连续翻页已启动；挥手即可停止。")
         except Exception as exc:
-            self.add_event(f"{event.label}  按键失败：{exc}")
-            self.gesture_info.set(f"最近手势：{event.label} · 按键发送失败")
+            self.stop_continuous(quiet=True)
+            self.add_event(f"{event.label}  连续翻页失败：{exc}")
+            self.gesture_info.set(f"最近手势：{event.label} · 连续翻页失败")
             self.signal_info.set(signal)
             self.detail.set(f"按键发送失败：{exc}")
 
