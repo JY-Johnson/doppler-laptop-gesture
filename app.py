@@ -238,7 +238,10 @@ class DopplerDetector:
         else:
             self.candidate_direction = direction
             self.candidate_frames = 1
-        if self.candidate_frames < 8:
+        # 5 analysis frames is roughly 200 ms at the current audio cadence;
+        # this is short enough for a deliberate page gesture but still rejects
+        # one-frame spectral spikes.
+        if self.candidate_frames < 5:
             return self._make_snapshot("检测中…", meter, display_db, peak_offset, peak_db), None
 
         self.candidate_direction = None
@@ -347,6 +350,18 @@ if os.name == "nt":
 
 
 class PageController:
+    def foreground_title(self) -> str:
+        if os.name != "nt":
+            return ""
+        user32 = ctypes.windll.user32
+        hwnd = user32.GetForegroundWindow()
+        if not hwnd:
+            return ""
+        length = user32.GetWindowTextLengthW(hwnd)
+        buffer = ctypes.create_unicode_buffer(length + 1)
+        user32.GetWindowTextW(hwnd, buffer, len(buffer))
+        return buffer.value
+
     def send(self, direction: str) -> None:
         if os.name != "nt":
             raise RuntimeError("桌面翻页控制只支持 Windows")
@@ -356,10 +371,13 @@ class PageController:
         user32 = ctypes.windll.user32
         user32.SendInput.argtypes = [ctypes.c_uint, ctypes.POINTER(INPUT), ctypes.c_int]
         user32.SendInput.restype = ctypes.c_uint
-        if user32.SendInput(1, ctypes.byref(key_down), ctypes.sizeof(INPUT)) != 1:
-            raise ctypes.WinError()
-        if user32.SendInput(1, ctypes.byref(key_up), ctypes.sizeof(INPUT)) != 1:
-            raise ctypes.WinError()
+        sent_down = user32.SendInput(1, ctypes.byref(key_down), ctypes.sizeof(INPUT))
+        sent_up = user32.SendInput(1, ctypes.byref(key_up), ctypes.sizeof(INPUT))
+        if sent_down == 1 and sent_up == 1:
+            return
+        # Compatibility fallback for some Windows security/input stacks.
+        user32.keybd_event(vk, 0, 0, 0)
+        user32.keybd_event(vk, 0, 2, 0)
 
 
 class App:
@@ -394,12 +412,13 @@ class App:
         self.start_button.grid(row=0, column=0, padx=(0, 8), pady=4)
         self.stop_button = ttk.Button(controls, text="停止", command=self.stop, state="disabled")
         self.stop_button.grid(row=0, column=1, padx=(0, 18), pady=4)
-        ttk.Label(controls, text="灵敏度").grid(row=0, column=2, sticky="e")
-        ttk.Scale(controls, from_=1, to=10, variable=self.sensitivity, orient="horizontal", length=150).grid(row=0, column=3, padx=8)
-        ttk.Label(controls, textvariable=self.sensitivity, width=3).grid(row=0, column=4)
-        ttk.Label(controls, text="载波音量").grid(row=0, column=5, padx=(18, 0), sticky="e")
-        ttk.Scale(controls, from_=0.005, to=0.06, variable=self.gain, orient="horizontal", length=150).grid(row=0, column=6, padx=8)
-        ttk.Checkbutton(controls, text="启用桌面翻页（当前前台窗口）", variable=self.page_control, command=self.control_changed).grid(row=1, column=0, columnspan=7, sticky="w", pady=(8, 0))
+        ttk.Button(controls, text="3 秒后测试 PageDown", command=self.schedule_test).grid(row=0, column=2, padx=(0, 18), pady=4)
+        ttk.Label(controls, text="灵敏度").grid(row=0, column=3, sticky="e")
+        ttk.Scale(controls, from_=1, to=10, variable=self.sensitivity, orient="horizontal", length=150).grid(row=0, column=4, padx=8)
+        ttk.Label(controls, textvariable=self.sensitivity, width=3).grid(row=0, column=5)
+        ttk.Label(controls, text="载波音量").grid(row=0, column=6, padx=(18, 0), sticky="e")
+        ttk.Scale(controls, from_=0.005, to=0.06, variable=self.gain, orient="horizontal", length=150).grid(row=0, column=7, padx=8)
+        ttk.Checkbutton(controls, text="启用桌面翻页（当前前台窗口）", variable=self.page_control, command=self.control_changed).grid(row=1, column=0, columnspan=8, sticky="w", pady=(8, 0))
 
         ttk.Label(outer, textvariable=self.status, font=("Segoe UI", 17, "bold")).pack(anchor="w", pady=(12, 2))
         self.meter = ttk.Progressbar(outer, maximum=100, mode="determinate")
@@ -417,6 +436,20 @@ class App:
 
     def control_changed(self) -> None:
         self.detail.set("桌面翻页已开启：靠近发送 PageDown，远离发送 PageUp。" if self.page_control.get() else "桌面翻页已关闭，只显示检测结果，不发送按键。")
+
+    def schedule_test(self) -> None:
+        self.detail.set("测试已排队：请在 3 秒内切换到要翻页的浏览器、PDF 或 PPT 窗口。")
+        self.root.after(3000, self.send_test_key)
+
+    def send_test_key(self) -> None:
+        try:
+            target = self.controller.foreground_title() or "未知窗口"
+            self.controller.send("down")
+            self.add_event(f"测试 PageDown → {target}")
+            self.detail.set(f"已向前台窗口发送 PageDown：{target}")
+        except Exception as exc:
+            self.add_event(f"测试 PageDown 失败：{exc}")
+            self.detail.set(f"PageDown 发送失败：{exc}")
 
     def start(self) -> None:
         if self.running:
@@ -462,10 +495,14 @@ class App:
             self.add_event(f"{event.label}（翻页关闭）")
             return
         try:
+            target = self.controller.foreground_title() or "未知窗口"
             self.controller.send("down" if event.kind == "approach" else "up")
-            self.add_event(f"{event.label}  →  {'PageDown' if event.kind == 'approach' else 'PageUp'}")
+            key = "PageDown" if event.kind == "approach" else "PageUp"
+            self.add_event(f"{event.label}  →  {key}  [{target}]")
+            self.detail.set(f"已向前台窗口发送 {key}：{target}")
         except Exception as exc:
             self.add_event(f"{event.label}  按键失败：{exc}")
+            self.detail.set(f"按键发送失败：{exc}")
 
     def draw_spectrum(self, snapshot: Snapshot) -> None:
         self.canvas.delete("all")
