@@ -402,10 +402,10 @@ class App:
         self.engine: Optional[AudioEngine] = None
         self.controller = PageController()
         self.running = False
-        self.sensitivity = tk.IntVar(value=3)
+        self.sensitivity = tk.IntVar(value=5)
         self.gain = tk.DoubleVar(value=0.02)
         self.page_control = tk.BooleanVar(value=False)
-        self.repeat_ms = tk.IntVar(value=900)
+        self.repeat_ms = tk.IntVar(value=600)
         self.repeat_direction: Optional[str] = None
         self.repeat_job: Optional[str] = None
         self.repeat_count = 0
