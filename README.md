@@ -1,6 +1,6 @@
 # Doppler Laptop Gesture
 
-一个只依赖笔记本扬声器和麦克风的浏览器手势感知实验原型。页面播放约 18 kHz 载波，分析麦克风收到的反射声频移，并把结果显示为实时频谱和示意动画。
+一个只依赖笔记本扬声器和麦克风的 Doppler 手势感知实验项目。项目同时提供浏览器演示和 Windows 桌面翻页客户端：播放约 18 kHz 载波，分析麦克风收到的反射声频移，并把结果显示为实时频谱。
 
 > Experimental prototype — not a production-grade gesture-recognition system.
 
@@ -11,6 +11,32 @@
 - 前后方向挥动：方向反转并经过短暂中性间隔后触发
 - 实时频率谱、噪声地板校准和误报抑制
 - 不使用摄像头，音频处理在浏览器本地完成
+
+## Windows 桌面翻页版
+
+`app.py` 是一个 Windows 桌面 MVP：
+
+- 靠近 → `PageDown`
+- 远离 → `PageUp`
+- 挥动 → 仅记录事件，不发送按键
+- “启用桌面翻页”默认关闭，勾选后才会控制当前前台窗口
+
+安装依赖并运行：
+
+```powershell
+py -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+.\.venv\Scripts\python.exe app.py
+```
+
+打包成单文件 EXE：
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install -r requirements-build.txt
+.\build.ps1
+```
+
+生成文件为 `dist\DopplerGesture.exe`。
 
 ## Run locally
 
