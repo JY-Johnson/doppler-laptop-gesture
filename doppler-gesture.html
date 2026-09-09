@@ -1,0 +1,406 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>笔记本 Doppler 手势感知原型</title>
+  <style>
+    :root { color-scheme: dark; font-family: system-ui, sans-serif; }
+    body { max-width: 760px; margin: 32px auto; padding: 0 18px; background: #10131a; color: #e8edf7; }
+    h1 { font-size: 25px; margin-bottom: 8px; }
+    p { color: #aab4c7; line-height: 1.55; }
+    .card { background: #191e29; border: 1px solid #2c3547; border-radius: 14px; padding: 18px; margin: 16px 0; }
+    button { border: 0; border-radius: 9px; padding: 10px 16px; background: #4d8dff; color: white; cursor: pointer; font-size: 15px; }
+    button:disabled { opacity: .45; cursor: default; }
+    #state { font-size: 22px; margin: 10px 0; color: #7dd3fc; }
+    #meter { height: 12px; background: #2b3444; border-radius: 8px; overflow: hidden; }
+    #bar { width: 0%; height: 100%; background: linear-gradient(90deg,#38bdf8,#a78bfa); transition: width .08s linear; }
+    code { color: #c4b5fd; }
+    li { margin: 6px 0; color: #cbd5e1; }
+    .small { font-size: 13px; }
+    label { display:block; margin-top: 12px; }
+    .visual-card { padding: 0; overflow: hidden; }
+    #visualizer { display: block; width: 100%; height: auto; background: #0d111a; }
+    .visual-caption { padding: 10px 16px 14px; color: #98a6bd; font-size: 13px; }
+    .frequency-card { padding: 14px 16px 12px; }
+    .frequency-head { display: flex; justify-content: space-between; gap: 12px; align-items: baseline; margin-bottom: 6px; }
+    #frequencyValue { color: #7dd3fc; font-size: 13px; }
+    #frequencyCanvas { display: block; width: 100%; height: auto; background: #0d111a; border-radius: 9px; }
+    .frequency-caption { color: #98a6bd; font-size: 13px; margin: 8px 2px 0; }
+  </style>
+</head>
+<body>
+  <h1>笔记本 Doppler 手势感知原型</h1>
+  <p>扬声器播放约 18 kHz 载波，麦克风分析反射声在载波两侧产生的频移。请把手放在扬声器和麦克风前方约 20–80 cm，避免耳朵长时间靠近扬声器。</p>
+
+  <div class="card visual-card">
+    <canvas id="visualizer" width="760" height="270" aria-label="Doppler 手势推断示意动画"></canvas>
+    <div class="visual-caption">示意动画：蓝色波纹代表声波，手掌位置和顶部标签代表算法推断结果，不是摄像头画面。</div>
+  </div>
+
+  <div class="card frequency-card">
+    <div class="frequency-head"><strong>实时频率谱</strong><span id="frequencyValue">等待音频输入</span></div>
+    <canvas id="frequencyCanvas" width="760" height="190" aria-label="18 kHz 附近的实时频率谱"></canvas>
+    <div class="frequency-caption">横轴是相对载波的频移 Δf；中线为 18,000 Hz，右侧高频侧带通常对应靠近，左侧低频侧带通常对应远离。</div>
+  </div>
+
+  <div class="card">
+    <button id="start">开始校准并启动</button>
+    <button id="stop" disabled>停止</button>
+    <label>灵敏度：<input id="sensitivity" type="range" min="1" max="10" value="5"></label>
+    <p class="small">静止时仍误触发：把灵敏度调到 2–3，停止后重新启动并在校准期间把手移出检测区。</p>
+    <div id="state">未启动</div>
+    <div id="meter"><div id="bar"></div></div>
+    <p id="detail" class="small">状态信息会显示在这里。</p>
+  </div>
+
+  <div class="card">
+    <strong>最近手势</strong>
+    <ul id="events"><li>等待开始</li></ul>
+  </div>
+
+  <div class="card small">
+    <strong>可识别的 MVP 手势</strong>
+    <ul>
+      <li>靠近：反射频率上移</li>
+      <li>远离：反射频率下移</li>
+      <li>挥动：靠近→短暂中性→远离，或反向连续出现</li>
+    </ul>
+    <p>如果完全没有反应，通常是系统音量过低、麦克风自动降噪/回声消除、设备不支持 18 kHz，或扬声器与麦克风距离太近导致直达声过强。</p>
+  </div>
+
+<script>
+(() => {
+  const F0 = 18000;
+  const BAND_MIN = 35;
+  const BAND_MAX = 360;
+  const FFT_SIZE = 32768;
+  let ctx, oscillator, outGain, analyser, stream, audioRaf, visualRaf;
+  let baselineHighDb = -100, baselineLowDb = -100;
+  let noiseHighDb = -100, noiseLowDb = -100, calibration = [];
+  let lastDirection = null, lastDirectionAt = 0, cooldownUntil = 0;
+  let highRiseEma = 0, lowRiseEma = 0, candidateDirection = null, candidateFrames = 0;
+  let waveCandidateDirection = null, waveCandidateFrames = 0, waveLastDirection = null, waveLastAt = 0;
+  let waveNeutralFrames = 0, waveAwaitingReverse = false;
+  let running = false;
+  let visualMode = 'idle', visualModeUntil = 0, handX = 0.72, handTargetX = 0.72;
+  let latestSpectrum = null, latestFreqs = null, latestBinHz = 0;
+
+  const $ = id => document.getElementById(id);
+  const state = $('state'), detail = $('detail'), bar = $('bar');
+  const canvas = $('visualizer'), g = canvas.getContext('2d');
+  const spectrumCanvas = $('frequencyCanvas'), fg = spectrumCanvas.getContext('2d'), frequencyValue = $('frequencyValue');
+
+  function resizeCanvas() {
+    const ratio = Math.max(1, Math.min(2, window.devicePixelRatio || 1));
+    const cssWidth = canvas.clientWidth || 760;
+    canvas.width = Math.round(cssWidth * ratio); canvas.height = Math.round(270 * ratio);
+    g.setTransform(ratio, 0, 0, ratio, 0, 0);
+  }
+  window.addEventListener('resize', resizeCanvas); resizeCanvas();
+
+  function resizeSpectrum() {
+    const ratio = Math.max(1, Math.min(2, window.devicePixelRatio || 1));
+    const cssWidth = spectrumCanvas.clientWidth || 760;
+    spectrumCanvas.width = Math.round(cssWidth * ratio); spectrumCanvas.height = Math.round(190 * ratio);
+    fg.setTransform(ratio, 0, 0, ratio, 0, 0);
+  }
+  window.addEventListener('resize', resizeSpectrum); resizeSpectrum();
+
+  function setVisualMode(mode, duration = 1100) {
+    visualMode = mode; visualModeUntil = performance.now() + duration;
+    handTargetX = mode === 'approach' ? 0.40 : mode === 'away' ? 0.76 : 0.72;
+    if (mode === 'wave') handTargetX = 0.58;
+  }
+
+  function roundRect(x, y, w, h, r) {
+    g.beginPath(); g.roundRect(x, y, w, h, r); g.fill();
+  }
+
+  function drawHand(x, y, scale, alpha) {
+    g.save(); g.globalAlpha = alpha; g.translate(x, y); g.scale(scale, scale);
+    g.shadowColor = '#a78bfa'; g.shadowBlur = 18; g.fillStyle = '#a78bfa';
+    // Palm and four fingers: a deliberately simple, low-distraction silhouette.
+    roundRect(-26, -28, 53, 68, 18);
+    roundRect(-30, -66, 12, 48, 6); roundRect(-14, -78, 12, 58, 6);
+    roundRect(2, -72, 12, 52, 6); roundRect(18, -57, 12, 38, 6);
+    g.rotate(-0.55); roundRect(-53, -5, 31, 13, 7); g.restore();
+  }
+
+  function drawVisualizer(now) {
+    const w = canvas.clientWidth || 760, h = 270, t = now / 1000;
+    g.clearRect(0, 0, w, h);
+    const bg = g.createLinearGradient(0, 0, w, h); bg.addColorStop(0, '#101827'); bg.addColorStop(1, '#111321');
+    g.fillStyle = bg; g.fillRect(0, 0, w, h);
+    const deviceX = Math.max(92, w * 0.15), centerY = h * 0.61;
+    if (now > visualModeUntil && visualMode !== 'idle') { visualMode = 'idle'; handTargetX = 0.72; }
+    handX += (handTargetX - handX) * 0.055;
+    if (visualMode === 'wave') handX = 0.58 + Math.sin(t * 8) * 0.17;
+    const handPx = w * handX;
+    const isMoving = visualMode !== 'idle';
+    const color = visualMode === 'approach' ? '#38bdf8' : visualMode === 'away' ? '#fbbf24' : '#a78bfa';
+
+    // Direction guide line.
+    g.setLineDash([5, 8]); g.strokeStyle = 'rgba(148,163,184,.22)'; g.lineWidth = 1;
+    g.beginPath(); g.moveTo(deviceX + 40, centerY); g.lineTo(w - 55, centerY); g.stroke(); g.setLineDash([]);
+    g.fillStyle = '#64748b'; g.font = '12px system-ui'; g.fillText('反射路径', deviceX + 48, centerY - 12);
+
+    // Laptop/speaker block.
+    g.fillStyle = '#263247'; roundRect(deviceX - 48, centerY - 48, 74, 96, 10);
+    g.fillStyle = '#0f172a'; roundRect(deviceX - 37, centerY - 36, 52, 40, 5);
+    g.fillStyle = '#60a5fa'; g.fillRect(deviceX - 30, centerY - 28, 38, 24);
+    g.fillStyle = '#94a3b8'; g.fillRect(deviceX - 32, centerY + 16, 42, 3);
+    for (let i = 0; i < 3; i++) { g.fillStyle = '#64748b'; g.beginPath(); g.arc(deviceX - 28 + i * 13, centerY + 30, 3, 0, Math.PI * 2); g.fill(); }
+    g.fillStyle = '#cbd5e1'; g.font = '12px system-ui'; g.fillText('扬声器 / 麦克风', deviceX - 49, centerY + 70);
+
+    // Expanding wavefronts. Their spacing changes with the detected mode to suggest frequency shift.
+    const compression = visualMode === 'approach' ? 0.68 : visualMode === 'away' ? 1.28 : 1;
+    for (let i = 0; i < 5; i++) {
+      const phase = ((t * 95 + i * 52) % 235) * compression;
+      const radius = 42 + phase;
+      const end = Math.min(handPx - deviceX, radius + 52);
+      if (end < 25) continue;
+      g.globalAlpha = Math.max(0, 0.52 - radius / 520); g.strokeStyle = color; g.lineWidth = 2;
+      g.beginPath(); g.arc(deviceX + 24, centerY, end, -0.52, 0.52); g.stroke();
+    }
+    g.globalAlpha = 1;
+    drawHand(handPx, centerY, 0.92, 1);
+
+    const title = visualMode === 'approach' ? '检测：靠近  ·  +Δf' : visualMode === 'away' ? '检测：远离  ·  −Δf' : visualMode === 'wave' ? '检测：挥动' : visualMode === 'calibrating' ? '校准环境噪声…' : '等待手势';
+    g.fillStyle = color; g.font = '600 18px system-ui'; g.fillText(title, 22, 30);
+    g.fillStyle = '#94a3b8'; g.font = '12px system-ui'; g.fillText('Doppler 频移示意', 22, 51);
+    if (isMoving) { g.fillStyle = color; g.font = '13px system-ui'; g.fillText(visualMode === 'away' ? '反射频率降低' : '反射频率升高', w - 128, 30); }
+    drawFrequency(now);
+    visualRaf = requestAnimationFrame(drawVisualizer);
+  }
+  visualRaf = requestAnimationFrame(drawVisualizer);
+
+  function drawFrequency(now) {
+    const w = spectrumCanvas.clientWidth || 760, h = 190;
+    const left = 48, right = 14, top = 22, bottom = 31;
+    const plotW = w - left - right, plotH = h - top - bottom;
+    const minDb = -100, maxDb = -20, minOffset = -360, maxOffset = 360;
+    fg.clearRect(0, 0, w, h);
+    const bg = fg.createLinearGradient(0, 0, w, h); bg.addColorStop(0, '#0f1726'); bg.addColorStop(1, '#111827');
+    fg.fillStyle = bg; fg.fillRect(0, 0, w, h);
+    const xFor = offset => left + (offset - minOffset) / (maxOffset - minOffset) * plotW;
+    const yFor = db => top + (maxDb - Math.max(minDb, Math.min(maxDb, db))) / (maxDb - minDb) * plotH;
+
+    // Lightly shaded Doppler sidebands.
+    fg.fillStyle = 'rgba(56,189,248,.08)'; fg.fillRect(xFor(BAND_MIN), top, xFor(maxOffset) - xFor(BAND_MIN), plotH);
+    fg.fillStyle = 'rgba(251,191,36,.08)'; fg.fillRect(xFor(minOffset), top, xFor(-BAND_MIN) - xFor(minOffset), plotH);
+    fg.strokeStyle = 'rgba(148,163,184,.17)'; fg.lineWidth = 1;
+    for (let db = -100; db <= -20; db += 20) {
+      const y = yFor(db); fg.beginPath(); fg.moveTo(left, y); fg.lineTo(w - right, y); fg.stroke();
+      fg.fillStyle = '#64748b'; fg.font = '10px system-ui'; fg.fillText(db + ' dB', 5, y + 3);
+    }
+    [-360, -180, 0, 180, 360].forEach(offset => {
+      const x = xFor(offset); fg.beginPath(); fg.moveTo(x, top); fg.lineTo(x, top + plotH); fg.stroke();
+      fg.fillStyle = offset === 0 ? '#e2e8f0' : '#64748b'; fg.font = '10px system-ui';
+      fg.fillText((offset > 0 ? '+' : '') + offset, x - 13, h - 10);
+    });
+    fg.fillStyle = '#94a3b8'; fg.font = '11px system-ui'; fg.fillText('Δf (Hz)', w - 47, h - 10);
+
+    // Carrier line and live spectrum trace.
+    const carrierX = xFor(0);
+    fg.strokeStyle = 'rgba(226,232,240,.75)'; fg.setLineDash([4, 4]);
+    fg.beginPath(); fg.moveTo(carrierX, top); fg.lineTo(carrierX, top + plotH); fg.stroke(); fg.setLineDash([]);
+    fg.fillStyle = '#e2e8f0'; fg.font = '10px system-ui'; fg.fillText('18 kHz', carrierX + 5, top + 11);
+    let peakDb = minDb, peakOffset = 0;
+    if (latestSpectrum && latestFreqs) {
+      fg.beginPath();
+      let started = false;
+      for (let i = 0; i < latestSpectrum.length; i++) {
+        const offset = latestFreqs[i] - F0;
+        if (offset < minOffset || offset > maxOffset) continue;
+        const db = latestSpectrum[i]; const x = xFor(offset), y = yFor(db);
+        if (!started) { fg.moveTo(x, y); started = true; } else fg.lineTo(x, y);
+        if (Math.abs(offset) >= BAND_MIN && Math.abs(offset) <= BAND_MAX && db > peakDb) { peakDb = db; peakOffset = offset; }
+      }
+      const grad = fg.createLinearGradient(0, top, 0, top + plotH); grad.addColorStop(0, '#a78bfa'); grad.addColorStop(1, '#38bdf8');
+      fg.strokeStyle = grad; fg.lineWidth = 1.6; fg.stroke();
+      if (peakDb > -95) {
+        const peakX = xFor(peakOffset), peakY = yFor(peakDb);
+        fg.fillStyle = peakOffset >= 0 ? '#38bdf8' : '#fbbf24'; fg.beginPath(); fg.arc(peakX, peakY, 3, 0, Math.PI * 2); fg.fill();
+        frequencyValue.textContent = `峰值 Δf ${peakOffset >= 0 ? '+' : ''}${peakOffset.toFixed(0)} Hz · ${peakDb.toFixed(0)} dB`;
+      } else frequencyValue.textContent = '未检测到明显侧带';
+    } else {
+      fg.strokeStyle = 'rgba(148,163,184,.35)'; fg.lineWidth = 1;
+      fg.beginPath(); fg.moveTo(left, yFor(-92)); fg.lineTo(w - right, yFor(-92)); fg.stroke();
+      frequencyValue.textContent = '等待音频输入';
+    }
+  }
+
+  function dbToPower(db) { return Math.pow(10, db / 10); }
+
+  function bandPower(data, freqs, lo, hi) {
+    let sum = 0, count = 0;
+    for (let i = 0; i < freqs.length; i++) {
+      const d = freqs[i] - F0;
+      if (d >= lo && d <= hi) { sum += dbToPower(data[i]); count++; }
+    }
+    return count ? sum / count : 0;
+  }
+
+  function powerToDb(power) { return 10 * Math.log10(Math.max(power, 1e-16)); }
+
+  function percentile(values, p) {
+    const sorted = values.slice().sort((a, b) => a - b);
+    if (!sorted.length) return -100;
+    const index = (sorted.length - 1) * p;
+    const lower = Math.floor(index), upper = Math.ceil(index);
+    return sorted[lower] + (sorted[upper] - sorted[lower]) * (index - lower);
+  }
+
+  function addEvent(text) {
+    const li = document.createElement('li');
+    li.textContent = new Date().toLocaleTimeString() + '  ' + text;
+    $('events').prepend(li);
+    while ($('events').children.length > 8) $('events').lastElementChild.remove();
+  }
+
+  function stop() {
+    running = false;
+    if (audioRaf) cancelAnimationFrame(audioRaf);
+    if (oscillator) { try { oscillator.stop(); } catch (_) {} }
+    if (stream) stream.getTracks().forEach(t => t.stop());
+    if (ctx) ctx.close();
+    oscillator = outGain = analyser = stream = ctx = null;
+    latestSpectrum = latestFreqs = null; latestBinHz = 0; frequencyValue.textContent = '等待音频输入';
+    candidateDirection = null; candidateFrames = 0; highRiseEma = 0; lowRiseEma = 0;
+    waveCandidateDirection = null; waveCandidateFrames = 0; waveLastDirection = null; waveLastAt = 0;
+    waveNeutralFrames = 0; waveAwaitingReverse = false;
+    $('start').disabled = false; $('stop').disabled = true;
+    state.textContent = '已停止'; bar.style.width = '0%'; setVisualMode('idle', 0);
+  }
+
+  async function start() {
+    $('start').disabled = true;
+    state.textContent = '请求麦克风权限…';
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({
+        audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false, channelCount: 1 }
+      });
+      ctx = new (window.AudioContext || window.webkitAudioContext)({ latencyHint: 'interactive' });
+      await ctx.resume();
+      analyser = ctx.createAnalyser(); analyser.fftSize = FFT_SIZE; analyser.smoothingTimeConstant = 0.15;
+      const source = ctx.createMediaStreamSource(stream); source.connect(analyser);
+      oscillator = ctx.createOscillator(); oscillator.type = 'sine'; oscillator.frequency.value = F0;
+      outGain = ctx.createGain(); outGain.gain.value = 0.035; // 低音量，避免刺耳
+      oscillator.connect(outGain).connect(ctx.destination); oscillator.start();
+      const binHz = ctx.sampleRate / FFT_SIZE;
+      if (F0 > ctx.sampleRate / 2 - 500) throw new Error('当前采样率不足以支持 18 kHz');
+      const data = new Float32Array(analyser.frequencyBinCount);
+      const freqs = data.map((_, i) => i * binHz);
+      latestSpectrum = data; latestFreqs = freqs; latestBinHz = binHz;
+      calibration = []; running = true; $('stop').disabled = false;
+      candidateDirection = null; candidateFrames = 0; highRiseEma = 0; lowRiseEma = 0;
+      waveCandidateDirection = null; waveCandidateFrames = 0; waveLastDirection = null; waveLastAt = 0;
+      waveNeutralFrames = 0; waveAwaitingReverse = false;
+      state.textContent = '校准中，请保持环境和手不动…'; setVisualMode('calibrating', 2100); detail.textContent = `采样率 ${ctx.sampleRate} Hz，频率分辨率 ${binHz.toFixed(2)} Hz`;
+      const started = performance.now();
+      function loop(now) {
+        if (!running) return;
+        analyser.getFloatFrequencyData(data);
+        const high = bandPower(data, freqs, BAND_MIN, BAND_MAX);
+        const low = bandPower(data, freqs, -BAND_MAX, -BAND_MIN);
+        if (now - started < 1800) {
+          // Store dB values; this avoids tiny linear-power baselines exploding into huge ratios.
+          calibration.push([powerToDb(high), powerToDb(low)]);
+          detail.textContent = `校准 ${Math.min(100, Math.round((now - started) / 18))}%：请保持安静并把手移出检测区`;
+        } else if (calibration.length) {
+          const highValues = calibration.map(x => x[0]);
+          const lowValues = calibration.map(x => x[1]);
+          baselineHighDb = percentile(highValues, 0.50); baselineLowDb = percentile(lowValues, 0.50);
+          noiseHighDb = percentile(highValues, 0.90); noiseLowDb = percentile(lowValues, 0.90);
+          calibration = [];
+          state.textContent = '可以做手势';
+          detail.textContent = `已建立噪声地板（高频 ${noiseHighDb.toFixed(1)} dB、低频 ${noiseLowDb.toFixed(1)} dB），需要连续多帧变化才触发`;
+        }
+        if (now - started >= 1800) detect(high, low, now);
+          audioRaf = requestAnimationFrame(loop);
+        }
+      audioRaf = requestAnimationFrame(loop);
+    } catch (err) {
+      detail.textContent = err.message || String(err);
+      state.textContent = '启动失败'; $('start').disabled = false;
+      if (stream) stream.getTracks().forEach(t => t.stop());
+    }
+  }
+
+  function updateWaveGesture(now, highThreshold, lowThreshold) {
+    // A wave needs a real neutral valley followed by a strong opposite segment.
+    // This prevents echo/ring-down after a single approach from becoming a wave.
+    const waveThreshold = Math.max(4.2, Math.min(highThreshold, lowThreshold) - 0.6);
+    const delta = highRiseEma - lowRiseEma;
+    const waveDirection = Math.max(highRiseEma, lowRiseEma) > waveThreshold
+      ? (delta > 2.2 ? '靠近' : delta < -2.2 ? '远离' : null)
+      : null;
+    if (waveLastDirection && now - waveLastAt > 1500) { waveLastDirection = null; waveAwaitingReverse = false; }
+    if (!waveDirection) {
+      waveCandidateDirection = null; waveCandidateFrames = 0;
+      if (waveLastDirection) {
+        waveNeutralFrames += 1;
+        if (waveNeutralFrames >= 3) waveAwaitingReverse = true;
+      }
+      return false;
+    }
+    waveNeutralFrames = 0;
+    if (waveCandidateDirection === waveDirection) waveCandidateFrames += 1;
+    else { waveCandidateDirection = waveDirection; waveCandidateFrames = 1; }
+    if (waveCandidateFrames < 6) return false;
+
+    if (waveLastDirection && waveLastDirection !== waveDirection && waveAwaitingReverse && now - waveLastAt <= 1500) {
+      addEvent(`挥动（${waveLastDirection} → ${waveDirection}）`);
+      state.textContent = '检测到挥动'; setVisualMode('wave', 1250);
+      waveLastDirection = null; waveLastAt = 0; waveCandidateDirection = null; waveCandidateFrames = 0;
+      waveNeutralFrames = 0; waveAwaitingReverse = false;
+      candidateDirection = null; candidateFrames = 0;
+      cooldownUntil = now + 700;
+      return true;
+    }
+    if (!waveLastDirection || waveLastDirection !== waveDirection) {
+      waveLastDirection = waveDirection; waveLastAt = now; waveAwaitingReverse = false;
+    }
+    waveCandidateFrames = 0;
+    return false;
+  }
+
+  function detect(high, low, now) {
+    const sensitivity = Number($('sensitivity').value);
+    const highRise = powerToDb(high) - baselineHighDb;
+    const lowRise = powerToDb(low) - baselineLowDb;
+    // Smooth short spikes, then require both a noise-floor exceedance and a clear direction gap.
+    highRiseEma = highRiseEma * 0.78 + highRise * 0.22;
+    lowRiseEma = lowRiseEma * 0.78 + lowRise * 0.22;
+    const sensitivityMargin = 5.8 - (sensitivity - 1) * 0.35;
+    const highThreshold = Math.max(3.5, noiseHighDb - baselineHighDb + sensitivityMargin);
+    const lowThreshold = Math.max(3.5, noiseLowDb - baselineLowDb + sensitivityMargin);
+    const directionGap = 3.0;
+    const highActive = highRiseEma > highThreshold && highRiseEma - lowRiseEma > directionGap;
+    const lowActive = lowRiseEma > lowThreshold && lowRiseEma - highRiseEma > directionGap;
+    const activity = Math.max(highRiseEma, lowRiseEma);
+    const percent = Math.min(100, Math.max(0, (activity / Math.max(highThreshold, lowThreshold)) * 100));
+    bar.style.width = percent + '%';
+    if (updateWaveGesture(now, highThreshold, lowThreshold)) return;
+    const direction = highActive ? '靠近' : lowActive ? '远离' : null;
+    if (!direction) { candidateDirection = null; candidateFrames = 0; return; }
+    if (now < cooldownUntil) return;
+    if (candidateDirection === direction) candidateFrames += 1;
+    else { candidateDirection = direction; candidateFrames = 1; }
+    // About 130 ms at 60 FPS: isolated spectral spikes never become a gesture.
+    if (candidateFrames < 8) return;
+    addEvent(direction);
+    state.textContent = direction; setVisualMode(direction === '靠近' ? 'approach' : 'away');
+    lastDirection = direction; lastDirectionAt = now;
+    candidateDirection = null; candidateFrames = 0;
+    cooldownUntil = now + 900;
+  }
+
+  $('start').onclick = start;
+  $('stop').onclick = stop;
+  window.addEventListener('beforeunload', stop);
+})();
+</script>
+</body>
+</html>
