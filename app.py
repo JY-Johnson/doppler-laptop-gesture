@@ -35,7 +35,7 @@ else:
 
 F0 = 18_000.0
 SAMPLE_RATE = 48_000
-FFT_SIZE = 32_768
+FFT_SIZE = 16_384
 BLOCK_SIZE = 2_048
 BAND_MIN = 35.0
 BAND_MAX = 360.0
@@ -322,11 +322,28 @@ class AudioEngine:
 if os.name == "nt":
     ULONG_PTR = ctypes.c_ulonglong if ctypes.sizeof(ctypes.c_void_p) == 8 else ctypes.c_ulong
 
+    class MOUSEINPUT(ctypes.Structure):
+        _fields_ = [
+            ("dx", ctypes.c_long),
+            ("dy", ctypes.c_long),
+            ("mouseData", ctypes.c_ulong),
+            ("dwFlags", ctypes.c_ulong),
+            ("time", ctypes.c_ulong),
+            ("dwExtraInfo", ULONG_PTR),
+        ]
+
     class KEYBDINPUT(ctypes.Structure):
         _fields_ = [("wVk", ctypes.c_ushort), ("wScan", ctypes.c_ushort), ("dwFlags", ctypes.c_ulong), ("time", ctypes.c_ulong), ("dwExtraInfo", ULONG_PTR)]
 
+    class HARDWAREINPUT(ctypes.Structure):
+        _fields_ = [("uMsg", ctypes.c_ulong), ("wParamL", ctypes.c_ushort), ("wParamH", ctypes.c_ushort)]
+
+    class INPUT_UNION(ctypes.Union):
+        _fields_ = [("mi", MOUSEINPUT), ("ki", KEYBDINPUT), ("hi", HARDWAREINPUT)]
+
     class INPUT(ctypes.Structure):
-        _fields_ = [("type", ctypes.c_ulong), ("ki", KEYBDINPUT)]
+        _anonymous_ = ("u",)
+        _fields_ = [("type", ctypes.c_ulong), ("u", INPUT_UNION)]
 
 
 class PageController:
@@ -334,9 +351,11 @@ class PageController:
         if os.name != "nt":
             raise RuntimeError("桌面翻页控制只支持 Windows")
         vk = 0x22 if direction == "down" else 0x21
-        key_down = INPUT(type=1, ki=KEYBDINPUT(vk, 0, 0, 0, 0))
-        key_up = INPUT(type=1, ki=KEYBDINPUT(vk, 0, 2, 0, 0))
+        key_down = INPUT(type=1, u=INPUT_UNION(ki=KEYBDINPUT(vk, 0, 0, 0, 0)))
+        key_up = INPUT(type=1, u=INPUT_UNION(ki=KEYBDINPUT(vk, 0, 2, 0, 0)))
         user32 = ctypes.windll.user32
+        user32.SendInput.argtypes = [ctypes.c_uint, ctypes.POINTER(INPUT), ctypes.c_int]
+        user32.SendInput.restype = ctypes.c_uint
         if user32.SendInput(1, ctypes.byref(key_down), ctypes.sizeof(INPUT)) != 1:
             raise ctypes.WinError()
         if user32.SendInput(1, ctypes.byref(key_up), ctypes.sizeof(INPUT)) != 1:
@@ -358,6 +377,7 @@ class App:
         self.page_control = tk.BooleanVar(value=False)
         self.status = tk.StringVar(value="未启动")
         self.detail = tk.StringVar(value="桌面翻页默认关闭；启动后请先完成校准。")
+        self.last_draw_at = 0.0
         self.build_ui()
         self.root.protocol("WM_DELETE_WINDOW", self.close)
         self.root.after(60, self.poll)
@@ -480,7 +500,7 @@ class App:
             for offset, db in zip(snapshot.offsets, snapshot.spectrum_db):
                 points.extend((x_for(offset), y_for(db)))
             if len(points) >= 4:
-                self.canvas.create_line(*points, fill="#67c9ff", width=2, smooth=True)
+                self.canvas.create_line(*points, fill="#67c9ff", width=2)
         if snapshot.spectrum_db and snapshot.peak_db > -105:
             x, y = x_for(snapshot.peak_offset), y_for(snapshot.peak_db)
             self.canvas.create_oval(x - 3, y - 3, x + 3, y + 3, fill="#fbbf24", outline="")
@@ -491,7 +511,10 @@ class App:
             snapshot = self.engine.current_snapshot()
             self.status.set(snapshot.status)
             self.meter.configure(value=snapshot.meter)
-            self.draw_spectrum(snapshot)
+            now = time.monotonic()
+            if now - self.last_draw_at >= 0.12:
+                self.draw_spectrum(snapshot)
+                self.last_draw_at = now
             while True:
                 try:
                     event = self.engine.events.get_nowait()
@@ -499,7 +522,9 @@ class App:
                     break
                 self.handle_event(event)
         else:
-            self.draw_spectrum(Snapshot())
+            if time.monotonic() - self.last_draw_at >= 0.12:
+                self.draw_spectrum(Snapshot())
+                self.last_draw_at = time.monotonic()
         if self.detector is not None:
             self.detector.set_sensitivity(self.sensitivity.get())
         self.root.after(60, self.poll)
