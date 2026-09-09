@@ -99,6 +99,7 @@ class DopplerDetector:
         self.wave_last_at = 0.0
         self.wave_neutral_frames = 0
         self.wave_awaiting_reverse = False
+        self.wave_mode_active = False
         self.cooldown_until = 0.0
         self.last_snapshot = Snapshot(status="等待音频缓冲…")
 
@@ -108,6 +109,9 @@ class DopplerDetector:
 
     def set_sensitivity(self, value: int) -> None:
         self.sensitivity = max(1, min(10, int(value)))
+
+    def set_wave_mode(self, active: bool) -> None:
+        self.wave_mode_active = active
 
     def _calculate_spectrum(self):
         transformed = np.fft.rfft(self.ring * self.window)
@@ -134,13 +138,21 @@ class DopplerDetector:
         return self.last_snapshot
 
     def _update_wave(self, now: float, high_threshold: float, low_threshold: float) -> Optional[GestureEvent]:
-        # A wave requires a neutral valley and a strong opposite segment.
-        wave_threshold = max(4.2, min(high_threshold, low_threshold) - 0.6)
+        # Continuous paging uses a faster interruption profile; ordinary
+        # recognition remains conservative to avoid turning noise into a wave.
+        wave_threshold = max(
+            2.8 if self.wave_mode_active else 4.2,
+            min(high_threshold, low_threshold) - (1.4 if self.wave_mode_active else 0.6),
+        )
+        direction_delta = 1.6 if self.wave_mode_active else 2.2
+        neutral_required = 2 if self.wave_mode_active else 3
+        frames_required = 4 if self.wave_mode_active else 6
+        detection_window = 1.8 if self.wave_mode_active else 1.5
         delta = self.high_ema - self.low_ema
         strength = max(self.high_ema, self.low_ema)
-        direction = "靠近" if strength > wave_threshold and delta > 2.2 else "远离" if strength > wave_threshold and delta < -2.2 else None
+        direction = "靠近" if strength > wave_threshold and delta > direction_delta else "远离" if strength > wave_threshold and delta < -direction_delta else None
 
-        if self.wave_last and now - self.wave_last_at > 1.5:
+        if self.wave_last and now - self.wave_last_at > detection_window:
             self.wave_last = None
             self.wave_awaiting_reverse = False
         if direction is None:
@@ -148,7 +160,7 @@ class DopplerDetector:
             self.wave_frames = 0
             if self.wave_last:
                 self.wave_neutral_frames += 1
-                if self.wave_neutral_frames >= 3:
+                if self.wave_neutral_frames >= neutral_required:
                     self.wave_awaiting_reverse = True
             return None
 
@@ -158,10 +170,10 @@ class DopplerDetector:
         else:
             self.wave_candidate = direction
             self.wave_frames = 1
-        if self.wave_frames < 6:
+        if self.wave_frames < frames_required:
             return None
 
-        if self.wave_last and self.wave_last != direction and self.wave_awaiting_reverse and now - self.wave_last_at <= 1.5:
+        if self.wave_last and self.wave_last != direction and self.wave_awaiting_reverse and now - self.wave_last_at <= detection_window:
             previous = self.wave_last
             self.wave_last = None
             self.wave_last_at = 0.0
@@ -463,6 +475,8 @@ class App:
         self.repeat_job = None
         self.repeat_direction = None
         self.repeat_count = 0
+        if self.detector is not None:
+            self.detector.set_wave_mode(False)
         if reason and was_running and not quiet:
             self.add_event(reason)
 
@@ -473,6 +487,8 @@ class App:
             self.stop_continuous(quiet=True)
             self.repeat_direction = direction
             self.repeat_count = 0
+        if self.detector is not None:
+            self.detector.set_wave_mode(True)
         self.repeat_page(event_label, snapshot)
 
     def repeat_page(self, event_label: str = "", snapshot: Optional[Snapshot] = None) -> None:
